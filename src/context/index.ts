@@ -25,7 +25,7 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier, groupTermsByRoot } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 
 /**
@@ -173,6 +173,31 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
   seedNames: [],         // Segment-vocab supplement — filled by the facade
 };
+
+/** A positive number from `process.env[name]`, else `fallback`. Read per call so a test can stub it. */
+function envNumber(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  const parsed = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
+
+/**
+ * Exponent on the visible-fraction weight in
+ * {@link ContextBuilder.termRarityWeights}. 1 is the plain fraction; higher
+ * values widen the gap between common terms (measured identical on the
+ * tuning set at 1 and 2 — 1 is kept for having no magic in it).
+ * `CODEGRAPH_TERM_RARITY_SHARPNESS` overrides it for ranking experiments;
+ * `0` disables the weighting outright.
+ */
+const termRaritySharpness = (): number => envNumber('CODEGRAPH_TERM_RARITY_SHARPNESS', 1, 0);
+
+/**
+ * A term reaching at most this many nodes keeps full weight in
+ * {@link ContextBuilder.termRarityWeights} however small the index is —
+ * below it, `sqrt(N)` would call a dozen matches "common" on a toy fixture.
+ * `CODEGRAPH_RARITY_FREE_REACH` overrides it for ranking experiments.
+ */
+const rarityFreeReachFloor = (): number => envNumber('CODEGRAPH_RARITY_FREE_REACH', 50, 1);
 
 // Re-export the low-confidence sentinel (defined in a dependency-free leaf so
 // the MCP layer can import it without pulling this module's deps onto the
@@ -446,6 +471,61 @@ export class ContextBuilder {
   }
 
   /**
+   * Per-term weight in (0, 1] for the text channel of
+   * {@link findRelevantContext}: how much of a term's match set the channel
+   * can actually see.
+   *
+   *   reach(t) = FTS rows a prefix match on `t` reaches
+   *   free     = max(rarityFreeReachFloor(), sqrt(N))
+   *   w(t)     = min(1, free / reach(t)) ^ termRaritySharpness()
+   *
+   * A term that reaches at most `free` nodes is a specific handle — the
+   * channel returns its whole neighbourhood, and every hit is evidence — so
+   * it keeps full weight. Beyond that the channel is sampling a lottery: on
+   * a 136k-node index `set` reaches 4,300 nodes and the 16 returned are the
+   * ones that happened to score, not the ones that matter. Those hits are
+   * discounted by the fraction the channel could not hold, so a prose
+   * query's ONE discriminating word (`eager`, 44 nodes) outranks its common
+   * ones (`system` 738, `task` 1,628) instead of losing every merged slot to
+   * their flat exact-name bonuses.
+   *
+   * Why ABSOLUTE reach and not idf (frequency relative to N): in a small,
+   * single-domain index the topic word IS the corpus. On a 270-node payroll
+   * fixture `cycle` reaches 22% of nodes and is exactly the hand-written
+   * workflow the query asks for; any relative measure discounts it into the
+   * generated CRUD's shadow. Sixty nodes is a neighbourhood an agent can
+   * read regardless of what fraction of the index it is. `sqrt(N)` lets the
+   * boundary grow with the index without tracking it linearly.
+   *
+   * The sharpness exponent widens the gap between common terms: at 1 the
+   * weight is the plain visible fraction, at 2 `system` (0.5 → 0.25) sits
+   * well below `subagent` (0.7 → 0.49).
+   *
+   * Terms whose reach cannot be measured (FTS5 unavailable, unusable token)
+   * get weight 1, so a missing signal degrades to the unweighted ranking
+   * rather than to silence.
+   */
+  private termRarityWeights(terms: string[], kinds: NodeKind[]): Map<string, number> {
+    const weights = new Map<string, number>();
+    let total = 0;
+    try {
+      total = this.queries.getTotalNodeCount();
+    } catch {
+      return weights;
+    }
+    if (total <= 0) return weights;
+    const freeReach = Math.max(rarityFreeReachFloor(), Math.sqrt(total));
+    const sharpness = termRaritySharpness();
+    for (const term of terms) {
+      const reach = this.queries.countFtsPrefixMatches(term, { kinds });
+      if (reach === null) continue;
+      const visible = Math.min(1, freeReach / Math.max(reach, 1));
+      weights.set(term, Math.pow(visible, sharpness));
+    }
+    return weights;
+  }
+
+  /**
    * Find relevant subgraph for a query
    *
    * Uses hybrid search combining exact symbol lookup with semantic search:
@@ -610,18 +690,29 @@ export class ContextBuilder {
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
              'route', 'component'] as NodeKind[];
+        // Each term is searched — and scored — on its own, so the per-term
+        // scores share no notion of how informative the term is. A flat
+        // exact-name bonus lifts `system` (matched in 700+ nodes) to the same
+        // ~100 as `EAGER` (44 nodes), and a prose query's ONE discriminating
+        // word loses every merged slot to its common ones. Weight each term's
+        // hits by how much of its match set the channel can see (see
+        // termRarityWeights) before they compete.
+        const rarity = this.termRarityWeights(searchTerms, searchKinds);
+        logDebug('Term rarity weights', { weights: Object.fromEntries(rarity) });
         for (const term of searchTerms) {
+          const weight = rarity.get(term) ?? 1;
           const termResults = this.queries.searchNodes(term, {
             limit: opts.searchLimit * 2,
             kinds: searchKinds,
           });
           for (const r of termResults) {
+            const weighted = r.score * weight;
             const existing = termResultsMap.get(r.node.id);
             if (existing) {
               existing.termHits++;
-              existing.result.score = Math.max(existing.result.score, r.score);
+              existing.result.score = Math.max(existing.result.score, weighted);
             } else {
-              termResultsMap.set(r.node.id, { result: r, termHits: 1 });
+              termResultsMap.set(r.node.id, { result: { ...r, score: weighted }, termHits: 1 });
             }
           }
         }
@@ -718,26 +809,11 @@ export class ContextBuilder {
     // (matches "shard" + "search" + "request").
     const queryTermsForBoost = extractSearchTerms(query);
     if (queryTermsForBoost.length >= 2) {
-      // Group terms that are substrings of each other (stem variants of the same
-      // root word). "indexed", "indexe", "index" should count as ONE concept match,
-      // not three. Without this, stem variants inflate matchCount and give false
-      // multi-term boosts to symbols matching one root word multiple times.
-      const termGroups: string[][] = [];
-      const sorted = [...queryTermsForBoost].sort((a, b) => b.length - a.length);
-      const assigned = new Set<string>();
-      for (const term of sorted) {
-        if (assigned.has(term)) continue;
-        const group = [term];
-        assigned.add(term);
-        for (const other of sorted) {
-          if (assigned.has(other)) continue;
-          if (term.includes(other) || other.includes(term)) {
-            group.push(other);
-            assigned.add(other);
-          }
-        }
-        termGroups.push(group);
-      }
+      // Stem variants of one root word ("indexed", "indexe", "index"; "setting",
+      // "sette", "set") count as ONE concept match, not several — otherwise a
+      // symbol matching one root several ways earns a false multi-term boost.
+      // See groupTermsByRoot for the rule.
+      const termGroups = groupTermsByRoot(queryTermsForBoost);
 
       // Build a set of exact-match node IDs so we can exempt them from dampening.
       // When the query is "LiveEditMode DevServerPreview", these are specific
@@ -978,6 +1054,15 @@ export class ContextBuilder {
     // later steps can outrank dampened single-term matches from earlier steps.
     searchResults.sort((a, b) => b.score - a.score);
     searchResults = searchResults.slice(0, opts.searchLimit * 3);
+    logDebug('Ranked search candidates', {
+      query,
+      candidates: searchResults.map((r) => ({
+        score: Math.round(r.score * 10) / 10,
+        kind: r.node.kind,
+        name: r.node.name,
+        file: r.node.filePath,
+      })),
+    });
 
     // Filter by minimum score
     let filteredResults = searchResults.filter((r) => r.score >= opts.minScore);

@@ -142,6 +142,49 @@ export function getStemVariants(term: string): string[] {
 }
 
 /**
+ * Whether two search terms are forms of the same root word, so that a symbol
+ * matching both counts as matching ONE query concept, not two.
+ *
+ * Substring covers most stems ("indexed" ⊃ "index"). The `-ing`/`-er` rules
+ * in {@link getStemVariants} also emit a `+e` form — "setting" → "sette",
+ * "handling" → "handle" — which is NOT a substring of its base and, left as
+ * its own concept, doubled `setText` on a query about settings. Two terms
+ * that agree on their first `max(4, shorter.length - 1)` characters are the
+ * same root as well; four, not three, so `role`/`roll` and `block`/`blob`
+ * stay apart.
+ */
+export function isSameRoot(a: string, b: string): boolean {
+  if (a.includes(b) || b.includes(a)) return true;
+  const shorter = Math.min(a.length, b.length);
+  const stem = Math.max(4, shorter - 1);
+  return shorter >= 4 && a.slice(0, stem) === b.slice(0, stem);
+}
+
+/**
+ * Partition query terms into root groups (see {@link isSameRoot}); longest
+ * term first in each group, groups in first-seen order.
+ */
+export function groupTermsByRoot(terms: string[]): string[][] {
+  const groups: string[][] = [];
+  const sorted = [...terms].sort((a, b) => b.length - a.length);
+  const assigned = new Set<string>();
+  for (const term of sorted) {
+    if (assigned.has(term)) continue;
+    const group = [term];
+    assigned.add(term);
+    for (const other of sorted) {
+      if (assigned.has(other)) continue;
+      if (isSameRoot(term, other)) {
+        group.push(other);
+        assigned.add(other);
+      }
+    }
+    groups.push(group);
+  }
+  return groups;
+}
+
+/**
  * Extract meaningful search terms from a natural language query.
  * Splits camelCase, PascalCase, snake_case, SCREAMING_SNAKE, and dot.notation
  * into individual tokens before filtering.

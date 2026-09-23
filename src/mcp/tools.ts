@@ -3551,6 +3551,37 @@ export class ToolHandler {
       const lcTokens = new Set(tokens.map((x) => x.toLowerCase()));
       const isPreciseToken = (x: string) =>
         /[._$]|::|\//.test(x) || /[a-z][A-Z]/.test(x) || /^[A-Z]/.test(x);
+      const preciseLcTokens = new Set(tokens.filter(isPreciseToken).map((x) => x.toLowerCase()));
+      // The corroborating sibling must itself be SPECIFIC. Any file large
+      // enough — a 15k-line session class, a generated protobuf, a platform
+      // `.d.ts` — declares a `task`, a `model`, a `role` and a `from`, so two
+      // bare English words corroborate each other there and the guard passes
+      // exactly where it should fail (the file then out-tiers the answer file
+      // that scored 2× higher). A name that is a symbol in more than a sliver
+      // of the corpus is ambient vocabulary, not evidence; a precise token
+      // always counts. The sliver scales with the project: 0.25% of indexed
+      // files, never below 8, so a small repo is not gated by a handful.
+      // `CODEGRAPH_AMBIENT_NAME_FILES` overrides the cap for ranking
+      // experiments (and lets a test pin both sides of the guard).
+      const ambientNameFileCap = (() => {
+        const raw = process.env.CODEGRAPH_AMBIENT_NAME_FILES;
+        const parsed = raw === undefined ? NaN : Number(raw);
+        if (Number.isFinite(parsed) && parsed >= 1) return parsed;
+        return Math.max(8, Math.ceil((indexedFileCount > 0 ? indexedFileCount : 0) * 0.0025));
+      })();
+      const nameFileCounts = new Map<string, number>();
+      const isSpecificName = (lc: string): boolean => {
+        let count = nameFileCounts.get(lc);
+        if (count === undefined) {
+          try {
+            count = cg.countFilesDeclaringName(lc);
+          } catch {
+            count = Number.POSITIVE_INFINITY; // unknowable — do not let it corroborate
+          }
+          nameFileCounts.set(lc, count);
+        }
+        return count <= ambientNameFileCap;
+      };
       const fileNameSets = new Map<string, Set<string>>();
       const coNamedInFile = (t: string, fp: string): boolean => {
         let names = fileNameSets.get(fp);
@@ -3563,7 +3594,8 @@ export class ToolHandler {
         }
         const self = t.toLowerCase();
         for (const o of lcTokens) {
-          if (o !== self && names.has(o)) return true;
+          if (o === self || !names.has(o)) continue;
+          if (preciseLcTokens.has(o) || isSpecificName(o)) return true;
         }
         return false;
       };

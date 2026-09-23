@@ -1601,6 +1601,11 @@ export class CodeGraph {
     return this.queries.getNodesByName(name);
   }
 
+  /** Distinct files declaring a symbol with this name, case-insensitively. */
+  countFilesDeclaringName(name: string): number {
+    return this.queries.countFilesDeclaringName(name);
+  }
+
   /** Nodes whose name starts with `prefix` (index range scan, capped). */
   getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
     return this.queries.getNodesByNamePrefix(prefix, limit);

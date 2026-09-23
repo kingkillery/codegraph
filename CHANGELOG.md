@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- **A prose `codegraph_explore` question no longer loses its one rare word to its common ones.** On a 136k-node index, "how the task.eager setting influences subagent delegation in the system prompt" rendered four wrong files: every query term is searched on its own and a flat exact-name bonus lifts a property called `system` (700+ nodes match `system*`) to the same score as `eagerTasks` (44 match `eager*`), so the discriminating word never reached a root. Each term's hits are now weighted by how much of its match set the channel can see — `min(1, max(50, √N) / reach)` — which leaves a small index's topic words alone and discounts a big one's ambient vocabulary. Two neighbours fixed on the way: a bare word (`task`, `model`, `role`) could earn the named-symbol tier from any file large enough to declare all three, so a 15k-line session class out-tiered the routing module that scored 2× higher — the corroborating sibling must now itself be a name declared in few files; and the `+e` stem the `-ing` rule emits (`setting` → `sette`) escaped root grouping and doubled `setText` on a query about settings. On an eight-question set over that index: answer file rendered 8/8 (was 7), answer first 6/8 (was 4), off-topic files 6 of 44 (was 18 of 53). `CODEGRAPH_TERM_RARITY_SHARPNESS=0` restores the unweighted ranking.
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)

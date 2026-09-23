@@ -277,6 +277,7 @@ export class QueryBuilder {
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
     getNodesByName?: SqliteStatement;
+    countFilesDeclaringName?: SqliteStatement;
     getNodesByNamePrefix?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
     getNodesByLowerName?: SqliteStatement;
@@ -1226,6 +1227,21 @@ export class QueryBuilder {
   }
 
   /**
+   * How many distinct files declare a symbol with this name, case-insensitively.
+   * `lower(name) = lower(?)` seeks `idx_nodes_lower_name`; see the note in
+   * `searchNodes` for why it must not be written `COLLATE NOCASE`.
+   */
+  countFilesDeclaringName(name: string): number {
+    if (!this.stmts.countFilesDeclaringName) {
+      this.stmts.countFilesDeclaringName = this.db.prepare(
+        'SELECT count(DISTINCT file_path) AS n FROM nodes WHERE lower(name) = lower(?)'
+      );
+    }
+    const row = this.stmts.countFilesDeclaringName.get(name) as { n: number } | undefined;
+    return row ? Number(row.n) : 0;
+  }
+
+  /**
    * Nodes whose name starts with `prefix`, by index range scan (a LIKE would
    * skip idx_nodes_name under SQLite's default case-insensitive LIKE).
    */
@@ -1517,6 +1533,51 @@ export class QueryBuilder {
       }
     }
     return results;
+  }
+
+  /**
+   * Reach of one search term: how many FTS rows a prefix match on `term`
+   * hits. Feeds the term-rarity weighting in `findRelevantContext`'s text
+   * channel, where a query's rare word ("eager") must outrank its common
+   * ones ("system", "prompt", "set") even though every term is searched — and
+   * scored — on its own. Returns `null` when FTS5 is unavailable or the term
+   * is empty so the caller can fall back to unweighted scores.
+   *
+   * Cost: one `count(*)` over the FTS index, sub-millisecond on a 136k-node
+   * corpus for both rare and ubiquitous terms.
+   */
+  countFtsPrefixMatches(term: string, options: { kinds?: NodeKind[] } = {}): number | null {
+    if (this._fts5Available === false) return null;
+    const cleaned = term
+      .replace(/::/g, ' ')
+      .replace(/['"*():^]/g, '')
+      .trim();
+    if (!cleaned || /^(AND|OR|NOT|NEAR)$/i.test(cleaned)) return null;
+    const { kinds } = options;
+    let sql = 'SELECT count(*) AS n FROM nodes_fts';
+    const params: string[] = [`"${cleaned}"*`];
+    if (kinds && kinds.length > 0) {
+      sql += ` JOIN nodes ON nodes_fts.id = nodes.id WHERE nodes_fts MATCH ? AND nodes.kind IN (${kinds.map(() => '?').join(',')})`;
+      params.push(...kinds);
+    } else {
+      sql += ' WHERE nodes_fts MATCH ?';
+    }
+    try {
+      const row = this.db.prepare(sql).get(...params) as { n: number } | undefined;
+      return row ? Number(row.n) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Total node count — the `N` in IDF. Not cached: the MCP daemon keeps one
+   * QueryBuilder open across index syncs, and this is one `count(*)` per
+   * `findRelevantContext` call.
+   */
+  getTotalNodeCount(): number {
+    const row = this.db.prepare('SELECT count(*) AS n FROM nodes').get() as { n: number };
+    return Number(row.n);
   }
 
   /**
